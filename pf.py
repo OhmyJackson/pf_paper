@@ -3,7 +3,7 @@ import pandas as pd
 import osmnx as ox
 import networkx as nx
 from collections import defaultdict
-
+from scipy.stats import spearmanr
 
 # -------------------------
 # 1) Graph
@@ -17,7 +17,8 @@ def build_drive_graph(place_name: str) -> nx.DiGraph:
     G = ox.distance.add_edge_lengths(G)
 
     Gu = nx.DiGraph()
-    Gu.add_nodes_from(G.nodes(data=True))
+    Gu.graph.update(G.graph)
+    Gu.graph["crs"] = G.graph["crs"]
 
     for u, v, k, data in G.edges(keys=True, data=True):
         w = data.get("length", np.nan)
@@ -163,3 +164,78 @@ def save_tables(df_edge: pd.DataFrame, df_od: pd.DataFrame, out_dir: str = "outp
     os.makedirs(out_dir, exist_ok=True)
     df_edge.to_csv(os.path.join(out_dir, "edge_table.csv"), index=False, encoding="utf-8-sig")
     df_od.to_csv(os.path.join(out_dir, "od_table.csv"), index=False, encoding="utf-8-sig")
+
+# -------------------------
+# 6) Compare betweenness
+# -------------------------
+
+# edge betweenness computation
+def compute_edge_betweenness(G, weight="length"):
+    """
+    Compute edge betweenness centrality.
+    Returns DataFrame with columns: [u, v, betweenness]
+    """
+    eb = nx.edge_betweenness_centrality(
+        G,
+        weight=weight,
+        normalized=True
+    )
+
+    return pd.DataFrame(
+        [(u, v, val) for (u, v), val in eb.items()],
+        columns=["u", "v", "betweenness"]
+    )
+
+## compare indices
+# pf.py
+
+def compare_forcedness_betweenness(
+    df_edge,
+    df_btw,
+    forced_col="forcedness_ln_median",
+    min_path1=3,
+    top_k=200
+):
+    """
+    Compare edge-level forcedness with betweenness.
+    Returns dict of summary statistics.
+    """
+
+    # 안정성 필터
+    df = df_edge.copy()
+    df = df[
+        (df["n_path1"] >= min_path1) &
+        np.isfinite(df[forced_col])
+    ]
+
+    # merge
+    df = df.merge(df_btw, on=["u", "v"], how="inner")
+    df = df[np.isfinite(df["betweenness"])]
+
+    # Spearman rank correlation
+    rho, pval = spearmanr(df[forced_col], df["betweenness"])
+
+    # Top-K overlap
+    topF = set(
+        df.sort_values(forced_col, ascending=False)
+          .head(top_k)[["u", "v"]]
+          .apply(tuple, axis=1)
+    )
+    topB = set(
+        df.sort_values("betweenness", ascending=False)
+          .head(top_k)[["u", "v"]]
+          .apply(tuple, axis=1)
+    )
+
+    inter = len(topF & topB)
+    jacc = inter / len(topF | topB) if (topF or topB) else np.nan
+
+    return {
+        "n_compared_edges": len(df),
+        "spearman_rho": float(rho),
+        "spearman_p": float(pval),
+        "topk_intersection": int(inter),
+        "topk_jaccard": float(jacc),
+    }
+
+
