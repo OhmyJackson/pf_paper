@@ -4,6 +4,7 @@ import osmnx as ox
 import networkx as nx
 from collections import defaultdict
 from scipy.stats import spearmanr
+import matplotlib.pyplot as plt
 
 # -------------------------
 # 1) Graph
@@ -239,3 +240,228 @@ def compare_forcedness_betweenness(
     }
 
 
+def plot_rank_rank_forcedness_betweenness(
+    df_edge,
+    df_btw,
+    forced_col="forcedness_ln_median",
+    min_path1=3,
+    top_k=200,
+    s_all=10,
+    s_top=25,
+    alpha_all=0.35,
+    alpha_top=0.85,
+    title=None
+):
+    """
+    Rank–rank scatter: Spearman을 '보여주는' 그림.
+    - df_edge: edge table (u,v, forcedness_ln_median, n_path1 등)
+    - df_btw : betweenness table (u,v, betweenness)
+    """
+
+    # 1) filter + merge (compare 함수와 동일 논리)
+    df = df_edge.copy()
+    df = df[(df["n_path1"] >= min_path1) & np.isfinite(df[forced_col])]
+    df = df.merge(df_btw, on=["u", "v"], how="inner")
+    df = df[np.isfinite(df["betweenness"])].copy()
+
+    if len(df) == 0:
+        raise ValueError("No edges remain after filtering/merge. Check min_path1/forced_col/merge keys.")
+
+    # 2) ranks (1 = highest)
+    df["rank_forced"] = df[forced_col].rank(ascending=False, method="average")
+    df["rank_btw"] = df["betweenness"].rank(ascending=False, method="average")
+
+    # 3) top-k forcedness flag
+    topF = set(
+        df.sort_values(forced_col, ascending=False)
+          .head(top_k)[["u", "v"]]
+          .apply(tuple, axis=1)
+    )
+    df["is_top_forced"] = df[["u", "v"]].apply(tuple, axis=1).isin(topF)
+
+    # 4) plot
+    plt.figure(figsize=(6, 5))
+    plt.scatter(
+        df.loc[~df["is_top_forced"], "rank_btw"],
+        df.loc[~df["is_top_forced"], "rank_forced"],
+        s=s_all, alpha=alpha_all, label="All compared edges"
+    )
+    plt.scatter(
+        df.loc[df["is_top_forced"], "rank_btw"],
+        df.loc[df["is_top_forced"], "rank_forced"],
+        s=s_top, alpha=alpha_top, label=f"Top-{top_k} forcedness edges"
+    )
+    plt.xlabel("Betweenness rank (1 = highest)")
+    plt.ylabel("Forcedness rank (1 = highest)")
+    if title:
+        plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return df  # 필요하면 df를 반환해 재사용 가능
+
+# 나눠서그리기
+def _prepare_cmp_df(df_edge, df_btw, forced_col="forcedness_ln_median", min_path1=3):
+    df = df_edge.copy()
+    df = df[(df["n_path1"] >= min_path1) & np.isfinite(df[forced_col])]
+    df = df.merge(df_btw, on=["u", "v"], how="inner")
+    df = df[np.isfinite(df["betweenness"])].copy()
+
+    if len(df) == 0:
+        raise ValueError("No edges remain after filtering/merge. Check min_path1/forced_col/merge keys.")
+    return df
+
+def plot_rank_rank_global(
+    df_edge, df_btw,
+    forced_col="forcedness_ln_median",
+    min_path1=3,
+    title="Rank–Rank (global): forcedness vs betweenness",
+    savepath=None
+):
+    df = _prepare_cmp_df(df_edge, df_btw, forced_col=forced_col, min_path1=min_path1)
+
+    df["rank_forced"] = df[forced_col].rank(ascending=False, method="average")
+    df["rank_btw"]    = df["betweenness"].rank(ascending=False, method="average")
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(df["rank_btw"], df["rank_forced"], s=10, alpha=0.35)
+    plt.xlabel("Betweenness rank (1 = highest)")
+    plt.ylabel("Forcedness rank (1 = highest)")
+    plt.title(title)
+    plt.tight_layout()
+    if savepath:
+        plt.savefig(savepath, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    return df
+
+def plot_rank_rank_topk_only(
+    df_edge, df_btw,
+    forced_col="forcedness_ln_median",
+    min_path1=3,
+    top_k=200,
+    title=None,
+    savepath=None
+):
+    df = _prepare_cmp_df(df_edge, df_btw, forced_col=forced_col, min_path1=min_path1)
+
+    # ranks (전체에서의 rank를 계산해둬야 top-k의 "위치"가 유지됨)
+    df["rank_forced"] = df[forced_col].rank(ascending=False, method="average")
+    df["rank_btw"]    = df["betweenness"].rank(ascending=False, method="average")
+
+    df_sorted = df.sort_values(forced_col, ascending=False)
+    df_top = df_sorted.head(top_k).copy()
+
+    if title is None:
+        title = f"Rank–Rank (top-{top_k} by forcedness), n_path1≥{min_path1}"
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(df_top["rank_btw"], df_top["rank_forced"], s=25, alpha=0.85)
+    plt.xlabel("Betweenness rank (1 = highest)")
+    plt.ylabel("Forcedness rank (1 = highest)")
+    plt.title(title)
+    plt.tight_layout()
+    if savepath:
+        plt.savefig(savepath, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    return df_top
+
+def plot_rank_rank_global_and_topk(
+    df_edge, df_btw,
+    forced_col="forcedness_ln_median",
+    min_path1=3,
+    top_k=200,
+    title_global="(a) Global rank–rank",
+    title_topk=None,
+    savepath=None
+):
+    df = _prepare_cmp_df(df_edge, df_btw, forced_col=forced_col, min_path1=min_path1)
+
+    df["rank_forced"] = df[forced_col].rank(ascending=False, method="average")
+    df["rank_btw"]    = df["betweenness"].rank(ascending=False, method="average")
+
+    df_sorted = df.sort_values(forced_col, ascending=False)
+    df_top = df_sorted.head(top_k).copy()
+
+    if title_topk is None:
+        title_topk = f"(b) Top-{top_k} forcedness edges"
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # (a) global
+    axes[0].scatter(df["rank_btw"], df["rank_forced"], s=10, alpha=0.35)
+    axes[0].set_xlabel("Betweenness rank (1 = highest)")
+    axes[0].set_ylabel("Forcedness rank (1 = highest)")
+    axes[0].set_title(title_global)
+
+    # (b) top-k only
+    axes[1].scatter(df_top["rank_btw"], df_top["rank_forced"], s=25, alpha=0.85)
+    axes[1].set_xlabel("Betweenness rank (1 = highest)")
+    axes[1].set_ylabel("Forcedness rank (1 = highest)")
+    axes[1].set_title(title_topk)
+
+    plt.tight_layout()
+    if savepath:
+        plt.savefig(savepath, dpi=300, bbox_inches="tight")
+    plt.show()
+
+    return df, df_top
+
+def plot_topk_overlap_curve(
+    df_edge,
+    df_btw,
+    forced_col="forcedness_ln_median",
+    min_path1=3,
+    k_list=None,
+    title=None):
+    """
+    Top-k overlap curve:
+      overlap_ratio(k) = |Top-k(forced) ∩ Top-k(btw)| / k
+    + Jaccard(k)도 함께 계산해서 DataFrame으로 반환.
+    """
+
+    if k_list is None:
+        k_list = [20, 50, 100, 150, 200, 300, 500]
+
+    # filter + merge (compare 함수와 동일)
+    df = df_edge.copy()
+    df = df[(df["n_path1"] >= min_path1) & np.isfinite(df[forced_col])]
+    df = df.merge(df_btw, on=["u", "v"], how="inner")
+    df = df[np.isfinite(df["betweenness"])].copy()
+
+    if len(df) == 0:
+        raise ValueError("No edges remain after filtering/merge. Check min_path1/forced_col/merge keys.")
+
+    # edge id
+    df["edge_id"] = df[["u", "v"]].apply(tuple, axis=1)
+
+    forced_sorted = df.sort_values(forced_col, ascending=False)["edge_id"].tolist()
+    btw_sorted = df.sort_values("betweenness", ascending=False)["edge_id"].tolist()
+
+    rows = []
+    for k in k_list:
+        A = set(forced_sorted[:k])
+        B = set(btw_sorted[:k])
+        inter = len(A & B)
+        union = len(A | B)
+        rows.append({
+            "k": int(k),
+            "intersection": int(inter),
+            "overlap_ratio": float(inter / k),
+            "jaccard": float(inter / union) if union else np.nan
+        })
+
+    out = pd.DataFrame(rows)
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(out["k"], out["overlap_ratio"], marker="o")
+    plt.xlabel("k")
+    plt.ylabel("|Top-k(F) ∩ Top-k(B)| / k")
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+    return out
