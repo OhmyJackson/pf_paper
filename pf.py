@@ -5,6 +5,8 @@ import networkx as nx
 from collections import defaultdict
 from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
+import pickle
+from tqdm import tqdm
 
 # -------------------------
 # 1) Graph
@@ -465,3 +467,184 @@ def plot_topk_overlap_curve(
     plt.show()
 
     return out
+
+## appendix_robustness
+
+def build_od_pool(
+    G,
+    n_pool: int,
+    seed: int = 0,
+    weight: str = "length",
+    save_path: str | None = None,
+):
+    """
+    균등 OD 샘플링(pool) 1회 계산 (비쌈)
+    저장 내용:
+      - s,t
+      - status
+      - forcedness_ln (ok만 finite)
+      - path1_edges: [(u,v), ...]  (edge-level 집계에 필요)
+    """
+    od_pairs = sample_od_pairs(G, n_od=n_pool, seed=seed)
+
+    pool = []
+    for (s, t) in tqdm(od_pairs, total=len(od_pairs), desc=f"Building OD pool (n={n_pool})"):
+        res = pair_forcedness_ln_status(G, s, t, weight=weight)
+        path1 = res["path1"]
+        edges = list(zip(path1[:-1], path1[1:])) if path1 else []
+
+        pool.append({
+            "s": s,
+            "t": t,
+            "status": res["status"],
+            "forcedness_ln": res["F_ln"],
+            "L1": res["L1"],
+            "L2": res["L2"],
+            "path_len_edges": (len(path1) - 1) if path1 else 0,
+            "path1_edges": edges,
+        })
+
+    if save_path:
+        with open(save_path, "wb") as f:
+            pickle.dump(pool, f)
+
+    return pool
+
+
+def load_od_pool(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+    
+def compute_tables_from_pool(pool, idx):
+    """
+    pool에서 idx로 선택된 OD만 사용해 df_edge, df_od 생성
+    - compute_tables()와 동일한 정의:
+      - edge_path1_count: path1 노출수
+      - edge_forcedness_vals: status==ok인 OD의 forcedness를 해당 path1 edge에 누적
+      - edge_no_alt_count: status==no_alt인 OD의 path1 edge에 누적
+    """
+    edge_forcedness_vals = defaultdict(list)
+    edge_path1_count = defaultdict(int)
+    edge_no_alt_count = defaultdict(int)
+
+    od_rows = []
+
+    for i in idx:
+        item = pool[i]
+        status = item["status"]
+        F = item["forcedness_ln"]
+        edges = item["path1_edges"]
+
+        od_rows.append({
+            "s": item["s"],
+            "t": item["t"],
+            "status": status,
+            "forcedness_ln": F,
+            "L1": item["L1"],
+            "L2": item["L2"],
+            "path_len_edges": item["path_len_edges"],
+        })
+
+        if not edges:
+            continue
+
+        for (u, v) in edges:
+            edge_path1_count[(u, v)] += 1
+            if status == "ok" and np.isfinite(F):
+                edge_forcedness_vals[(u, v)].append(F)
+            elif status == "no_alt":
+                edge_no_alt_count[(u, v)] += 1
+
+    edge_rows = []
+    for (u, v), n_path1 in edge_path1_count.items():
+        vals = edge_forcedness_vals.get((u, v), [])
+        n_no_alt = edge_no_alt_count.get((u, v), 0)
+
+        edge_rows.append({
+            "u": u,
+            "v": v,
+            "forcedness_ln_mean": float(np.mean(vals)) if vals else np.nan,
+            "forcedness_ln_median": float(np.median(vals)) if vals else np.nan,
+            "n_forcedness": int(len(vals)),
+            "n_path1": int(n_path1),
+            "n_no_alt": int(n_no_alt),
+            "no_alt_ratio": (n_no_alt / n_path1) if n_path1 > 0 else np.nan
+        })
+
+    return pd.DataFrame(edge_rows), pd.DataFrame(od_rows)
+
+
+def make_main_run_from_pool(pool, n_main: int, seed: int = 0):
+    """
+    본문 결과에 쓸 대표 run:
+    - pool에서 n_main개를 1회 서브샘플링
+    - compute_tables_from_pool로 df_edge/df_od 생성
+    """
+    rng = np.random.default_rng(seed)
+    N = len(pool)
+    if n_main > N:
+        raise ValueError(f"n_main({n_main}) > pool size({N}). Increase N_pool.")
+
+    idx = rng.choice(N, size=n_main, replace=False)
+    df_edge, df_od = compute_tables_from_pool(pool, idx)
+    return df_edge, df_od, idx
+
+
+def _summary_for_robustness(df_edge: pd.DataFrame, df_od: pd.DataFrame, forced_col="forcedness_ln_median"):
+    # no_alt rate
+    no_alt_rate = float((df_od["status"] == "no_alt").mean()) if len(df_od) else np.nan
+
+    # OD forcedness (ok만)
+    od_forced = df_od.loc[df_od["status"] == "ok", "forcedness_ln"].astype(float)
+    od_forced = od_forced[np.isfinite(od_forced)]
+    od_q50 = float(od_forced.quantile(0.50)) if len(od_forced) else np.nan
+    od_q90 = float(od_forced.quantile(0.90)) if len(od_forced) else np.nan
+
+    # Edge forcedness (median)
+    edge_forced = df_edge[forced_col].astype(float)
+    edge_forced = edge_forced[np.isfinite(edge_forced)]
+    edge_q50 = float(edge_forced.quantile(0.50)) if len(edge_forced) else np.nan
+
+    return {
+        "no_alt_rate": no_alt_rate,
+        "od_q50": od_q50,
+        "od_q90": od_q90,
+        "edge_q50": edge_q50,
+        "n_edges_with_forced": int(len(edge_forced)),
+        "n_ok": int((df_od["status"] == "ok").sum()),
+    }
+
+
+def robustness_from_pool(pool, sample_sizes, repeats=20, seed=0):
+    rng = np.random.default_rng(seed)
+    N = len(pool)
+
+    rows = []
+    for n_od in sample_sizes:
+        if n_od > N:
+            raise ValueError(f"n_od({n_od}) > pool size({N}). Increase N_pool.")
+        for r in range(repeats):
+            idx = rng.choice(N, size=n_od, replace=False)
+            df_edge, df_od = compute_tables_from_pool(pool, idx)
+            summ = _summary_for_robustness(df_edge, df_od, forced_col="forcedness_ln_median")
+            summ.update({"n_od": int(n_od), "repeat": int(r)})
+            rows.append(summ)
+
+    return pd.DataFrame(rows)
+
+
+def plot_metric_ci(df_res, metric, title=None):
+    g = df_res.groupby("n_od")[metric].agg(["mean", "std", "count"]).reset_index()
+    # 95% CI: mean ± 1.96 * std/sqrt(n)
+    g["ci_half"] = 1.96 * g["std"] / np.sqrt(g["count"].clip(lower=1))
+
+    plt.figure(figsize=(6, 4))
+    plt.errorbar(g["n_od"], g["mean"], yerr=g["ci_half"], fmt="o-", capsize=3)
+    plt.xlabel("Number of OD samples (n_od)")
+    plt.ylabel(metric)
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+    return g
