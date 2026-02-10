@@ -249,8 +249,8 @@ def plot_rank_rank_forcedness_betweenness(
     min_path1=3,
     top_k=200,
     s_all=10,
-    s_top=25,
-    alpha_all=0.35,
+    s_top=10,
+    alpha_all=0.25,
     alpha_top=0.85,
     title=None
 ):
@@ -297,8 +297,8 @@ def plot_rank_rank_forcedness_betweenness(
     plt.ylabel("Forcedness rank (1 = highest)")
     if title:
         plt.title(title)
-    plt.legend()
-    plt.tight_layout()
+    plt.legend(bbox_to_anchor = (0.5,1.02),loc = "lower center",ncol=2, frameon = True)
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
     plt.show()
 
     return df  # 필요하면 df를 반환해 재사용 가능
@@ -355,8 +355,8 @@ def plot_rank_rank_topk_only(
     df_sorted = df.sort_values(forced_col, ascending=False)
     df_top = df_sorted.head(top_k).copy()
 
-    if title is None:
-        title = f"Rank–Rank (top-{top_k} by forcedness), n_path1≥{min_path1}"
+    #if title is None:
+    #    title = f"Rank–Rank (top-{top_k} by forcedness), n_path1≥{min_path1}"
 
     plt.figure(figsize=(6, 5))
     plt.scatter(df_top["rank_btw"], df_top["rank_forced"], s=25, alpha=0.85)
@@ -393,7 +393,7 @@ def plot_rank_rank_global_and_topk(
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     # (a) global
-    axes[0].scatter(df["rank_btw"], df["rank_forced"], s=10, alpha=0.35)
+    axes[0].scatter(df["rank_btw"], df["rank_forced"], s=6, alpha=0.3,edgecolors="none")
     axes[0].set_xlabel("Betweenness rank (1 = highest)")
     axes[0].set_ylabel("Forcedness rank (1 = highest)")
     axes[0].set_title(title_global)
