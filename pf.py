@@ -7,6 +7,7 @@ from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
 import pickle
 from tqdm import tqdm
+import geopandas as gpd
 
 # -------------------------
 # 1) Graph
@@ -189,8 +190,165 @@ def compute_edge_betweenness(G, weight="length"):
         columns=["u", "v", "betweenness"]
     )
 
+## map for visualization
+
+
+def edges_to_gdf(G):
+    """
+    DiGraph -> edge GeoDataFrame with geometry.
+    Requires that edges have 'geometry' (OSMnx usually provides it).
+    If missing, build a straight LineString from node coords.
+    """
+    import shapely.geometry as sg
+
+    rows = []
+    for u, v, data in G.edges(data=True):
+        geom = data.get("geometry", None)
+        if geom is None:
+            # fallback: straight line between nodes
+            x1, y1 = G.nodes[u].get("x"), G.nodes[u].get("y")
+            x2, y2 = G.nodes[v].get("x"), G.nodes[v].get("y")
+            if (x1 is None) or (y1 is None) or (x2 is None) or (y2 is None):
+                continue
+            geom = sg.LineString([(x1, y1), (x2, y2)])
+        rows.append({"u": u, "v": v, "geometry": geom})
+
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=G.graph.get("crs", None))
+    return gdf
+
+
+def prepare_edge_map_gdf(G, df_edge, df_btw, forced_col="forcedness_ln_median"):
+    """
+    Returns GeoDataFrame with columns:
+      u, v, geometry, forced_col, betweenness
+    """
+    gdf_edges = edges_to_gdf(G)
+
+    # keep required cols only
+    dfF = df_edge[["u", "v", forced_col, "n_path1"]].copy()
+    dfB = df_btw[["u", "v", "betweenness"]].copy()
+
+    gdf = gdf_edges.merge(dfF, on=["u", "v"], how="left")
+    gdf = gdf.merge(dfB, on=["u", "v"], how="left")
+
+    return gdf
+
+
+def _quantile_bins(series, q=(0, .2, .4, .6, .8, 1.0)):
+    """
+    Returns bin labels and bin assignment (pd.Categorical).
+    Handles duplicates by falling back to rank-based cut if needed.
+    """
+    x = series.copy()
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return None, None
+
+    qs = series.quantile(list(q))
+    qs = np.unique(qs.values)  # drop duplicates
+    if len(qs) < 3:
+        # fallback: rank-based bins
+        r = series.rank(method="average", pct=True)
+        bins = pd.cut(r, bins=[0, .2, .4, .6, .8, 1.0], include_lowest=True)
+        labels = ["Q0-20", "Q20-40", "Q40-60", "Q60-80", "Q80-100"]
+        return labels, bins
+
+    bins = pd.cut(series, bins=qs, include_lowest=True, duplicates="drop")
+    # build labels with fixed quintile names (best-effort)
+    labels = ["Q0-20", "Q20-40", "Q40-60", "Q60-80", "Q80-100"][:len(bins.cat.categories)]
+    return labels, bins
+
+
+def plot_edge_metric_map_quantiles(
+    gdf,
+    value_col,
+    title,
+    figsize=(6.5, 6.5),
+    linewidth=1.0,
+    legend_out=True,
+    legend_title=None,
+    ax=None
+):
+    """
+    Plot edges in quantile bins (quintiles) for a given value_col.
+    Legend is moved outside if legend_out=True.
+    """
+    plot_gdf = gdf[np.isfinite(gdf[value_col])].copy()
+    if plot_gdf.empty:
+        raise ValueError(f"No finite values in column '{value_col}' for plotting.")
+
+    labels, bins = _quantile_bins(plot_gdf[value_col])
+    plot_gdf["qbin"] = bins
+
+    # Use consistent label order
+    cat = plot_gdf["qbin"].cat
+    # Map categories -> labels (same length)
+    if labels is None:
+        labels = [str(c) for c in cat.categories]
+    mapper = {cat.categories[i]: labels[i] for i in range(len(cat.categories))}
+    plot_gdf["qbin_label"] = plot_gdf["qbin"].map(mapper)
+
+    # plot
+    if ax is None:
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+    else:
+        fig = ax.figure
+
+    plot_gdf.plot(
+        column="qbin_label",
+        categorical=True,
+        legend=True,
+        linewidth=linewidth,
+        ax=ax
+    )
+    ax.set_axis_off()
+    ax.set_title(title)
+
+    leg = ax.get_legend()
+    if leg is not None:
+        if legend_title:
+            leg.set_title(legend_title)
+        if legend_out:
+            # move outside
+            leg.set_bbox_to_anchor((1.02, 1))
+            leg._loc = 2  # upper left
+
+    fig.tight_layout()
+    return ax
+
+def compute_edge_betweenness_sampled_from_od(G, od_pairs, weight="length", normalized=True):
+    edge_cnt = defaultdict(float)
+    n_used = 0
+
+    for s, t in tqdm(od_pairs, total=len(od_pairs), desc="Sampled betweenness (OD shortest paths)"):
+        try:
+            path = nx.shortest_path(G, s, t, weight=weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+        edges = list(zip(path[:-1], path[1:]))
+        if not edges:
+            continue
+
+        for e in edges:
+            edge_cnt[e] += 1.0
+        n_used += 1
+
+    df = pd.DataFrame([(u, v, val) for (u, v), val in edge_cnt.items()],
+                      columns=["u", "v", "betweenness"])
+
+    if normalized and n_used > 0:
+        # 각 OD가 총 1단위의 흐름을 만든다는 의미에서, OD 개수로 정규화
+        df["betweenness"] = df["betweenness"] / float(n_used)
+
+    return df, n_used
+
+
+
+
 ## compare indices
-# pf.py
+## plots
+
 
 def compare_forcedness_betweenness(
     df_edge,
@@ -468,7 +626,15 @@ def plot_topk_overlap_curve(
 
     return out
 
-## appendix_robustness
+
+
+
+
+
+
+# -------------------------
+# 7) appendix_robustness
+# -------------------------
 
 def build_od_pool(
     G,
